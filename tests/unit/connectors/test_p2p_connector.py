@@ -43,6 +43,7 @@ def _fake_vllm_config(
             hf_text_config=text_config,
         ),
         parallel_config=SimpleNamespace(
+            enable_dbo=False,
             data_parallel_size=data_parallel_size,
             data_parallel_rank=data_parallel_rank,
             prefill_context_parallel_size=1,
@@ -118,6 +119,7 @@ def test_p2p_connector_uses_nested_text_config_for_multimodal_model():
                 hf_text_config=text_config,
             ),
             parallel_config=SimpleNamespace(
+                enable_dbo=False,
                 data_parallel_size=1,
                 data_parallel_rank=0,
                 prefill_context_parallel_size=1,

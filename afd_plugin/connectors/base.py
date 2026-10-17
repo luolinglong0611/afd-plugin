@@ -61,6 +61,11 @@ class AFDConnectorBase(ABC):
     attn_size: int = 0
     ffn_size: int = 0
 
+    @property
+    def supports_independent_dbo_streams(self) -> bool:
+        """Whether data transfers can progress independently of GPU compute."""
+        return False
+
     @classmethod
     @abstractmethod
     def parse_extra_config(

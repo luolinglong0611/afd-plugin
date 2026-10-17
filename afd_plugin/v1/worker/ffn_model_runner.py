@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -50,6 +50,9 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
 
+DBO_MICROBATCH_COUNT = 2
+
+
 class GPUFFNModelRunner(LoRAModelRunnerMixin):
     """FFN model runner for AFD GPU execution.
 
@@ -91,6 +94,9 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
         self.use_cuda_graph = bool(
             self.afd_cudagraph_policy.enable_ffn_graph_cache,
         )
+        self._pipeline_receive_stream: torch.cuda.Stream | None = None
+        self._pipeline_send_stream: torch.cuda.Stream | None = None
+        self._pipeline_tensors: list[torch.Tensor] = []
         self._cuda_graphs: dict[tuple, dict[str, Any]] = {}
         self._graph_memory_pool: Any | None = None
         self.prof = create_afd_gpu_profiler("ffn")
@@ -104,6 +110,12 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
 
     def initialize_afd_connector(self) -> None:
         self.connector.init_afd_connector()
+        if (
+            self.connector.supports_independent_dbo_streams
+            and self._pipeline_receive_stream is None
+        ):
+            self._pipeline_receive_stream = torch.cuda.Stream(device=self.device)
+            self._pipeline_send_stream = torch.cuda.Stream(device=self.device)
 
     def load_model(self, *, load_dummy_weights: bool = False, **kwargs: Any) -> None:
         """Load the vLLM model."""
@@ -196,6 +208,17 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
             stage_idx: self._make_ffn_dp_metadata(dp_metadata_list[stage_idx])
             for stage_idx in stage_ids
         }
+        overlap = (
+            self.connector.supports_independent_dbo_streams
+            and len(stage_ids) == DBO_MICROBATCH_COUNT
+        )
+        compute_stream = torch.cuda.current_stream() if overlap else None
+        self._pipeline_tensors = []
+        if overlap:
+            assert self._pipeline_receive_stream is not None
+            assert self._pipeline_send_stream is not None
+            self._pipeline_receive_stream.wait_stream(compute_stream)
+            self._pipeline_send_stream.wait_stream(compute_stream)
         recv_input_ids = getattr(self.model, "afd_requires_input_ids", False)
         with _ffn_forward_context(self.vllm_config) as forward_context:
             for layer_idx in layer_indices:
@@ -211,10 +234,29 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
                         recv_kwargs["routing_spec"] = routing_spec
                     if recv_input_ids:
                         recv_kwargs["recv_input_ids"] = True
-                    payload = self.connector.recv_attn_output(
-                        ubatch_idx=stage_idx,
-                        **recv_kwargs,
+                    receive_context = (
+                        torch.cuda.stream(self._pipeline_receive_stream)
+                        if overlap
+                        else nullcontext()
                     )
+                    with receive_context:
+                        payload = self.connector.recv_attn_output(
+                            ubatch_idx=stage_idx,
+                            **recv_kwargs,
+                        )
+                    if overlap:
+                        compute_stream.wait_stream(self._pipeline_receive_stream)
+                        # Retain asynchronous inputs/outputs through graph lifetime;
+                        # a later layer must not recycle their storage too early.
+                        for tensor in (
+                            payload.hidden_states,
+                            payload.router_logits,
+                            payload.input_ids,
+                        ):
+                            if tensor is not None:
+                                self._pipeline_tensors.append(tensor)
+                                if not torch.cuda.is_current_stream_capturing():
+                                    tensor.record_stream(compute_stream)
                     hidden_states = payload.hidden_states
                     context = payload.context
                     metadata = context.metadata
@@ -243,7 +285,19 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
                             layer_idx,
                             input_ids=payload.input_ids,
                         )
-                    self.connector.send_ffn_output(rank_ffn_output, context)
+                    if overlap:
+                        self._pipeline_tensors.append(rank_ffn_output)
+                        self._pipeline_send_stream.wait_stream(compute_stream)
+                        with torch.cuda.stream(self._pipeline_send_stream):
+                            self.connector.send_ffn_output(rank_ffn_output, context)
+                        if not torch.cuda.is_current_stream_capturing():
+                            rank_ffn_output.record_stream(self._pipeline_send_stream)
+                    else:
+                        self.connector.send_ffn_output(rank_ffn_output, context)
+        if overlap:
+            # Join every side stream before graph capture ends or next step starts.
+            compute_stream.wait_stream(self._pipeline_receive_stream)
+            compute_stream.wait_stream(self._pipeline_send_stream)
         return rank_ffn_output
 
     def _execute_eager_mode(
@@ -321,6 +375,7 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
                 )
             self._cuda_graphs[graph_key] = {
                 "graph": cudagraph,
+                "pipeline_tensors": tuple(self._pipeline_tensors),
                 "input_hidden_states": output,
                 "output": output,
             }
@@ -415,6 +470,7 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
             for graph_info in self._cuda_graphs.values():
                 graph_info["graph"].reset()
             self._cuda_graphs.clear()
+            self._pipeline_tensors.clear()
             self._graph_memory_pool = None
             self.vllm_config.compilation_config.static_forward_context.clear()
             self.model = None

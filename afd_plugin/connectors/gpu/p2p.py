@@ -33,7 +33,8 @@ Control and data planes:
     connector exposes a ``control_plane``, each FFN-side step is driven by the
     arrival of a control-plane payload. The
     data path stays on the connector and uses
-    ``PyNcclCommunicator.send()`` / ``recv()`` on the current CUDA stream,
+    ``PyNcclCommunicator.send()`` / ``recv()`` on the current CUDA stream
+    without DBO, or directional streams with explicit dependencies with DBO,
     wrapped in the ``torch.ops.vllm.afd_p2p_send`` / ``afd_p2p_recv`` custom
     ops so transfers stay usable under ``torch.compile`` and CUDA graph
     capture.
@@ -180,6 +181,12 @@ class P2pNcclAFDConnector(AFDConnectorBase):
         """
         super().__init__(rank, local_rank, vllm_config, afd_config, role_rank)
         self._initialized = False
+        # DBO uses independent directions so a queued next-stage send cannot
+        # block the current-stage result receive on the same CUDA stream.
+        self._overlap_enabled = vllm_config.parallel_config.enable_dbo
+        self._send_stream: torch.cuda.Stream | None = None
+        self._receive_stream: torch.cuda.Stream | None = None
+        self._attention_send_done: tuple[torch.cuda.Event, ...] = ()
         self.mapping = build_rank_mapping(afd_config, role_rank)
         self.world_rank = self.mapping.world_rank
         self.p2p_rank = self.mapping.p2p_rank
@@ -261,6 +268,13 @@ class P2pNcclAFDConnector(AFDConnectorBase):
         if self._initialized:
             return
 
+        # Allocate only after the worker selected its CUDA device. Connector
+        # construction stays free of device initialization for metadata tests.
+        if self._overlap_enabled:
+            self._send_stream = torch.cuda.Stream(device=self.local_rank)
+            self._receive_stream = torch.cuda.Stream(device=self.local_rank)
+            self._attention_send_done = (torch.cuda.Event(), torch.cuda.Event())
+
         _register_p2p_custom_ops()
 
         afd_pg = init_afd_process_group(
@@ -317,7 +331,28 @@ class P2pNcclAFDConnector(AFDConnectorBase):
         """Return whether the NCCL groups and communicators are ready."""
         return self._initialized
 
+    @property
+    def supports_independent_dbo_streams(self) -> bool:
+        return self._overlap_enabled
+
     def send_attn_output(
+        self,
+        hidden_states: torch.Tensor,
+        context: AFDTransferContext,
+        **kwargs: Any,
+    ) -> None:
+        if not self._overlap_enabled:
+            return self._send_attn_output_current_stream(
+                hidden_states, context, **kwargs
+            )
+        assert self._send_stream is not None
+        compute_stream = torch.cuda.current_stream(hidden_states.device)
+        self._send_stream.wait_stream(compute_stream)
+        with torch.cuda.stream(self._send_stream):
+            self._send_attn_output_current_stream(hidden_states, context, **kwargs)
+            self._attention_send_done[context.metadata.stage_idx].record()
+
+    def _send_attn_output_current_stream(
         self,
         hidden_states: torch.Tensor,
         context: AFDTransferContext,
@@ -387,6 +422,27 @@ class P2pNcclAFDConnector(AFDConnectorBase):
             )
 
     def recv_ffn_output(
+        self,
+        ref_tensor: torch.Tensor,
+        ubatch_idx: int = 0,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        if not self._overlap_enabled:
+            return self._recv_ffn_output_current_stream(
+                ref_tensor, ubatch_idx, **kwargs
+            )
+        assert self._receive_stream is not None
+        compute_stream = torch.cuda.current_stream(ref_tensor.device)
+        with torch.cuda.stream(self._receive_stream):
+            # The result may reuse the activation buffer only after its send.
+            self._receive_stream.wait_event(self._attention_send_done[ubatch_idx])
+            output = self._recv_ffn_output_current_stream(
+                ref_tensor, ubatch_idx, **kwargs
+            )
+        compute_stream.wait_stream(self._receive_stream)
+        return output
+
+    def _recv_ffn_output_current_stream(
         self,
         ref_tensor: torch.Tensor,
         ubatch_idx: int = 0,

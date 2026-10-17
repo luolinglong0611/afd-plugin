@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 from collections import deque
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -32,6 +33,8 @@ from afd_plugin.v1.worker.ffn_worker import AFDFFNWorker  # noqa: E402
 
 
 class _FakeConnector:
+    supports_independent_dbo_streams = False
+
     def __init__(self):
         self.attn_outputs = deque()
         self.ffn_outputs = []
@@ -151,6 +154,7 @@ def _runner_with_connector_and_model(model, *, num_layers=1):
     runner.num_layers = num_layers
     runner.use_cuda_graph = False
     runner._cuda_graphs = {}
+    runner._pipeline_tensors = []
     runner.prof = None
     return runner
 
@@ -779,3 +783,70 @@ def test_ffn_worker_loop_logs_unexpected_thread_errors(caplog):
     with pytest.raises(RuntimeError, match="AFD FFN worker loop failed") as exc:
         worker.raise_ffn_loop_error_if_any()
     assert exc.value.__cause__ is expected_error
+
+
+def test_ffn_dbo_orders_directional_streams_and_retains_graph_inputs(monkeypatch):
+    calls = []
+    active = ["compute"]
+
+    class Stream:
+        def __init__(self, name):
+            self.name = name
+
+        def wait_stream(self, other):
+            calls.append((self.name, "wait", other.name))
+
+    @contextmanager
+    def stream_context(stream):
+        previous = active[0]
+        active[0] = stream.name
+        yield
+        active[0] = previous
+
+    class Model(_FakeModel):
+        def compute_ffn_output(self, hidden_states, layer_idx):
+            calls.append(("compute", active[0], hidden_states))
+            return hidden_states
+
+    runner = _runner_with_connector_and_model(Model())
+    runner.connector.supports_independent_dbo_streams = True
+    runner._pipeline_receive_stream = Stream("receive")
+    runner._pipeline_send_stream = Stream("send")
+    compute = Stream("compute")
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: compute)
+    monkeypatch.setattr(torch.cuda, "stream", stream_context)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    for stage in (0, 1):
+        runner.connector.attn_outputs.append(
+            _payload(f"stage{stage}", _metadata_for_stage(stage))
+        )
+    original_receive = runner.connector.recv_attn_output
+    original_send = runner.connector.send_ffn_output
+
+    def receive(**kwargs):
+        calls.append(("receive", active[0], kwargs["ubatch_idx"]))
+        return original_receive(**kwargs)
+
+    def send(output, context):
+        calls.append(("send", active[0], context.metadata.stage_idx))
+        return original_send(output, context)
+
+    runner.connector.recv_attn_output = receive
+    runner.connector.send_ffn_output = send
+    runner.execute_model(
+        dp_metadata_list={0: _FakeDPMetadata([1]), 1: _FakeDPMetadata([1])}
+    )
+    assert [
+        (x[0], x[1])
+        for x in calls
+        if x[0] in ("receive", "compute", "send") and x[1] != "wait"
+    ] == [
+        ("receive", "receive"),
+        ("compute", "compute"),
+        ("send", "send"),
+        ("receive", "receive"),
+        ("compute", "compute"),
+        ("send", "send"),
+    ]
+    assert calls[-2:] == [("compute", "wait", "receive"), ("compute", "wait", "send")]
+    assert runner._pipeline_tensors == ["stage0", "stage0", "stage1", "stage1"]
