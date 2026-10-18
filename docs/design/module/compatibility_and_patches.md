@@ -86,8 +86,9 @@ compatibility evidence rather than a released package or container tag.
 The vLLM plugin entry point applies compatibility in this order:
 
 1. perform the non-strict vLLM version check;
-2. import `async_dp_engine`, `async_dp_forward_context`, `config_validation`,
-   and `engine_core` in one best-effort block;
+2. import `async_dp_engine`, install `async_llm`, then import
+   `async_dp_forward_context`, `config_validation`, and `engine_core` in one
+   best-effort block;
 3. register the plugin-owned CUDA benchmark routing strategy as a required
    step;
 4. register the plugin-owned DBO yield operator in a best-effort block;
@@ -223,3 +224,26 @@ Runtime refactor decisions in
 [#86](https://github.com/JiusiServe/afd-plugin/issues/86) may remove or relocate
 patches. The documentation RFC remains tracked by
 [#129](https://github.com/JiusiServe/afd-plugin/issues/129).
+
+
+## CUDA AFD API output fairness (vLLM 0.26.0)
+
+`compat/patches/async_llm.py` copies `AsyncLLM._run_output_handler` from the
+exact pinned vLLM release. After each output message it yields cooperatively
+only for CUDA AFD Attention. A ready output queue does not guarantee that
+`await queue.get()` suspends, and upstream only yields inside a message when
+its batch exceeds the configured output-processing chunk size. The extra
+scheduling point covers sub-chunk and empty statistics messages without
+changing output order, token contents, aborts, metric recording, or GPU
+scheduling. Non-AFD, FFN, and non-CUDA paths retain copied upstream behavior.
+The installer refuses other vLLM versions and is idempotent.
+
+The semantic owner is the compatibility module. The general-plugin entry
+point installs it alongside the existing engine patches; importing the module
+alone needs no runtime dependencies. Focused tests are in
+`tests/unit/compat/patches/test_async_llm.py`. This is a fairness correction,
+not a claim that one Python process can process unlimited token throughput.
+Qualification must check output backlog, metrics responsiveness, steady TPS,
+KV, and running with unchanged serving parameters. Propose the per-message
+fairness point upstream and remove this copy when the pinned upstream provides
+it. No NPU performance claim is made.
